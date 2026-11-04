@@ -1,0 +1,419 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Poster generator</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; font: 14px system-ui, sans-serif; display: flex; height: 100vh; background: #1b1b1b; color: #eee; }
+  #panel { width: 290px; flex: none; padding: 16px; overflow: auto; background: #222; box-sizing: border-box; }
+  #panel h3 { margin: 0 0 8px; }
+  #panel label { display: block; margin: 14px 0 4px; }
+  #panel input[type=range] { width: 100%; }
+  #panel select, #panel input[type=number] { width: 100%; padding: 4px; box-sizing: border-box; }
+  .val { float: right; opacity: .7; }
+  .row { display: flex; gap: 6px; align-items: center; }
+  .row input { flex: 1; }
+  button { padding: 8px; margin-top: 8px; cursor: pointer; }
+  #export { width: 100%; padding: 10px; margin-top: 18px; font-size: 15px; }
+  #info { margin-top: 12px; opacity: .7; line-height: 1.4; }
+  #view { flex: 1; display: flex; align-items: center; justify-content: center; padding: 16px; box-sizing: border-box; min-width: 0; }
+  #poster { max-width: 100%; max-height: 100%; background: #fff; box-shadow: 0 0 24px #000; }
+</style>
+</head>
+<body>
+<div id="panel">
+  <h3>Постер</h3>
+  <label>Формат
+    <select id="size">
+      <option value="A1">A1</option>
+      <option value="A2" selected>A2</option>
+      <option value="A3">A3</option>
+    </select>
+  </label>
+  <label>Ориентация
+    <select id="orient">
+      <option value="landscape" selected>Альбомная</option>
+      <option value="portrait">Книжная</option>
+    </select>
+  </label>
+  <label>Раскладка
+    <select id="mode">
+      <option value="rows" selected>Ряды (justify)</option>
+      <option value="random">Случайная упаковка</option>
+      <option value="flush">Вплотную (ряды)</option>
+    </select>
+  </label>
+  <label>Шум размеров <span class="val" id="vX"></span>
+    <input type="range" id="noise" min="0" max="1" step="0.05" value="0.5">
+  </label>
+  <label>Наложение <span class="val" id="vO"></span>
+    <input type="range" id="overlap" min="0" max="1" step="0.05" value="0.5">
+  </label>
+  <label><input type="checkbox" id="captions" checked> Подписи авторов</label>
+  <label>Изображений <span class="val" id="vN"></span>
+    <input type="range" id="count" min="5" max="200" value="200">
+  </label>
+  <label>Рядов <span class="val" id="vR"></span>
+    <input type="range" id="rows" min="3" max="40" value="12">
+  </label>
+  <label>Зазор, мм <span class="val" id="vG"></span>
+    <input type="range" id="gap" min="0" max="20" step="0.5" value="3">
+  </label>
+  <label>Seed
+    <div class="row">
+      <input type="number" id="seed" value="1" min="0" step="1">
+      <button id="reseed" title="Новый случайный seed">🎲</button>
+    </div>
+  </label>
+  <label>Интерполяция
+    <select id="quality">
+      <option value="low">линейная</option>
+      <option value="medium">средняя</option>
+      <option value="high" selected>высокая</option>
+    </select>
+  </label>
+  <label>DPI экспорта
+    <select id="dpi">
+      <option value="150">150</option>
+      <option value="300" selected>300</option>
+    </select>
+  </label>
+  <button id="export">Скачать PNG</button>
+  <div id="info">Загрузка фото…</div>
+</div>
+<div id="view"><canvas id="poster"></canvas></div>
+
+<script>
+const SIZES = { A1: [594, 841], A2: [420, 594], A3: [297, 420] }; // mm, portrait
+const $ = id => document.getElementById(id);
+let photos = [];
+
+// Seeded PRNG (mulberry32): the same seed always gives the same order.
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = a + 0x6D2B79F5 | 0;
+    let t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+
+function shuffled(list, seed) {
+  const r = mulberry32(seed);
+  const a = list.slice();
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(r() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
+// Greedy justified rows, same logic as poster_print.py: each row gets about the same total aspect.
+function packRows(aspects, nRows) {
+  const target = aspects.reduce((s, a) => s + a, 0) / nRows;
+  const rows = [];
+  let row = [], acc = 0;
+  aspects.forEach((a, i) => {
+    const remRows = nRows - rows.length;
+    const remItems = aspects.length - i;
+    if (row.length && acc + a / 2 > target && remRows > 1 && remItems >= remRows) {
+      rows.push(row); row = []; acc = 0;
+    }
+    row.push(i); acc += a;
+  });
+  if (row.length) rows.push(row);
+  return rows;
+}
+
+// Exact fit, no cropping. Every image keeps its true aspect ratio: in a row the widths are
+// proportional to the aspects, so the row height is (row width) / (sum of aspects) and the row
+// spans W exactly. The vertical gap between rows is then solved so the rows fill H exactly.
+// All row counts are tried; the best one has a vertical gap close to the horizontal gap and a
+// row count close to the slider. Rows that would be too tall for the page are skipped. If no
+// row count fits, the last images are left out and reported.
+function layout(items, W, H, gap, nRows) {
+  let list = items, dropped = 0, best = null, aspects = [];
+  while (list.length && !best) {
+    aspects = list.map(im => im.naturalWidth / im.naturalHeight);
+    let bestScore = Infinity;
+    for (let R = 2; R <= list.length; R++) {
+      const rows = packRows(aspects, R);
+      if (rows.length < 2) continue;
+      const rowsH = rows.map(idx =>
+        (W - gap * (idx.length - 1)) / idx.reduce((s, i) => s + aspects[i], 0));
+      const sumH = rowsH.reduce((s, h) => s + h, 0);
+      const vgap = (H - sumH) / (rows.length - 1);
+      if (vgap < 0) continue; // these rows are too tall for the page
+      // The row count from the slider comes first; the vertical gap is only a tie-breaker.
+      const score = Math.abs(rows.length - nRows) * 100 + Math.abs(vgap - gap);
+      if (score < bestScore) { bestScore = score; best = { rows, rowsH, vgap }; }
+    }
+    if (!best) { list = list.slice(0, -1); dropped++; }
+  }
+  if (!best) return { cells: [], rows: 0, vgap: 0, dropped, overflow: true };
+
+  const cells = [];
+  let y = 0;
+  best.rows.forEach((idx, r) => {
+    const h = best.rowsH[r];
+    const avail = W - gap * (idx.length - 1);
+    const sumA = idx.reduce((s, i) => s + aspects[i], 0);
+    let x = 0;
+    for (const i of idx) {
+      const w = avail * aspects[i] / sumA;
+      cells.push({ img: list[i], x, y, w, h,
+        sx: 0, sy: 0, sw: list[i].naturalWidth, sh: list[i].naturalHeight });
+      x += w + gap;
+    }
+    y += h + best.vgap;
+  });
+  return { cells, rows: best.rows.length, vgap: best.vgap, dropped, overflow: dropped > 0 };
+}
+
+// Random guillotine packing: the page is split recursively into rectangles, one image per
+// rectangle. The split direction follows the longer side. Noise 0 gives an even split,
+// noise 1 a strongly uneven one. Images are fitted inside their rectangle without cropping,
+// so unfilled space shows as white; the coverage is reported.
+function randomPack(s) {
+  const rnd = mulberry32(s.seed + 7919);
+  const cells = [];
+  const fit = (img, x, y, w, h) => {
+    const a = img.naturalWidth / img.naturalHeight;
+    let dw = w, dh = w / a;
+    if (dh > h) { dh = h; dw = h * a; }
+    // Grow by the overlap factor, never crop: the image may spill a little onto neighbours.
+    const k = Math.min(1 + s.overlap, s.W / dw, s.H / dh);
+    dw *= k; dh *= k;
+    // Keep the image inside the page.
+    const px = Math.min(Math.max(x + (w - dw) / 2, 0), s.W - dw);
+    const py = Math.min(Math.max(y + (h - dh) / 2, 0), s.H - dh);
+    cells.push({ img, x: px, y: py, w: dw, h: dh,
+      sx: 0, sy: 0, sw: img.naturalWidth, sh: img.naturalHeight });
+  };
+  const split = (list, x, y, w, h) => {
+    if (list.length === 1) { fit(list[0], x, y, w, h); return; }
+    const nLeft = Math.floor(list.length / 2);
+    const p = Math.min(0.9, Math.max(0.1,
+      nLeft / list.length * (1 + s.noise * (rnd() * 2 - 1) * 0.8)));
+    const left = list.slice(0, nLeft), right = list.slice(nLeft);
+    if (w >= h) {
+      const wl = (w - s.gap) * p;
+      split(left, x, y, wl, h);
+      split(right, x + wl + s.gap, y, w - wl - s.gap, h);
+    } else {
+      const hl = (h - s.gap) * p;
+      split(left, x, y, w, hl);
+      split(right, x, y + hl + s.gap, w, h - hl - s.gap);
+    }
+  };
+  if (s.items.length) split(s.items, 0, 0, s.W, s.H);
+  const drawn = cells.reduce((t, c) => t + c.w * c.h, 0);
+  return { cells, rows: 0, vgap: 0, dropped: 0, overflow: false,
+    coverage: 100 * drawn / (s.W * s.H) };
+}
+
+// Flush mode: rows of images stacked with their edges touching. The page height is free and
+// follows from the rows. Options:
+//  gap:     space between images in a row and between rows (mm). Rows get narrower for the same width.
+//  overlap: each image is enlarged around its cell by this fraction, so neighbours overlap a little.
+//           The enlargement is uniform (no distortion) and stays inside the page.
+//  noise:   randomises where rows break, so image sizes vary. The seed fixes the randomness.
+function flushLayout(s) {
+  const items = s.items, W = s.W, gap = s.gap;
+  const aspects = items.map(im => im.naturalWidth / im.naturalHeight);
+  const rnd = mulberry32(s.seed + 104729);
+
+  // Greedy rows. With noise, each row's target aspect share varies randomly.
+  const avg = aspects.reduce((t, a) => t + a, 0) / s.nRows;
+  const jitter = () => avg * (1 + s.noise * (rnd() * 2 - 1) * 0.5);
+  const rows = [];
+  let row = [], acc = 0, target = jitter();
+  aspects.forEach((a, i) => {
+    if (row.length && acc + a / 2 > target && rows.length < s.nRows - 1) {
+      rows.push(row); row = []; acc = 0; target = jitter();
+    }
+    row.push(i); acc += a;
+  });
+  if (row.length) rows.push(row);
+
+  // Noise-driven gaps and overlaps. The noise is sampled on the row/column grid, so it does
+  // not depend on page height. Horizontal gaps differ per joint; the vertical gap is uniform.
+  const vnoise = valueNoise(s.seed + 31337);
+  const rowData = rows.map((idx, r) => {
+    const gapsIn = idx.slice(1).map((_, j) => s.gap * vnoise(r * 0.9, j * 0.9));
+    const sumGaps = gapsIn.reduce((t, g) => t + g, 0);
+    const sumA = idx.reduce((t, i) => t + aspects[i], 0);
+    return { idx, gapsIn, h: (W - sumGaps) / sumA };
+  });
+  const Hf = rowData.reduce((t, rd) => t + rd.h, 0) + gap * (rows.length - 1);
+
+  const cells = [];
+  let y = 0;
+  rowData.forEach((rd, r) => {
+    let x = 0;
+    rd.idx.forEach((i, j) => {
+      const w = rd.h * aspects[i];
+      const ov = s.overlap * vnoise(r * 0.9 + 50, j * 0.9 + 200);
+      // Uniform enlargement: same factor in both directions, so the shape holds.
+      const k = Math.min(1 + ov, W / w, Hf / rd.h);
+      const w2 = w * k, h2 = rd.h * k;
+      const x2 = Math.min(Math.max(x - (w2 - w) / 2, 0), W - w2);
+      const y2 = Math.min(Math.max(y - (h2 - rd.h) / 2, 0), Hf - h2);
+      cells.push({ img: items[i], x: x2, y: y2, w: w2, h: h2,
+        sx: 0, sy: 0, sw: items[i].naturalWidth, sh: items[i].naturalHeight });
+      if (j < rd.gapsIn.length) x += w + rd.gapsIn[j];
+    });
+    y += rd.h + gap;
+  });
+  return { cells, rows: rows.length, H: Hf, dev: 0, vgap: gap, dropped: 0, overflow: false };
+}
+
+// Smooth 2D value noise in [0, 1]. Lattice values come from a seeded table, so the same seed
+// always gives the same field.
+function valueNoise(seed) {
+  const r = mulberry32(seed);
+  const table = new Float64Array(256);
+  for (let i = 0; i < 256; i++) table[i] = r();
+  const lattice = (a, b) => table[((a * 73856093) ^ (b * 19349663)) & 255];
+  const fade = t => t * t * (3 - 2 * t);
+  return (x, y) => {
+    const xi = Math.floor(x), yi = Math.floor(y);
+    const u = fade(x - xi), v = fade(y - yi);
+    const a = lattice(xi, yi), b = lattice(xi + 1, yi);
+    const c = lattice(xi, yi + 1), d = lattice(xi + 1, yi + 1);
+    const top = a + (b - a) * u, bottom = c + (d - c) * u;
+    return top + (bottom - top) * v;
+  };
+}
+
+// Small credit in the bottom-left corner of an image. Sized in mm, so it prints at the same size.
+function drawCaption(ctx, c, pxPerMm) {
+  const text = c.img.author;
+  if (!text) return;
+  const fs = 2.2 * pxPerMm;   // font size: 2.2 mm
+  const pad = 0.8 * pxPerMm;
+  const x = c.x * pxPerMm;
+  const yBottom = (c.y + c.h) * pxPerMm;
+  ctx.save();
+  ctx.font = `${fs}px sans-serif`;
+  const bh = fs * 1.5;
+  const tw = ctx.measureText(text).width;
+  ctx.fillStyle = 'rgba(0,0,0,0.6)';
+  ctx.fillRect(x, yBottom - bh, tw + 2 * pad, bh);
+  ctx.fillStyle = '#fff';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(text, x + pad, yBottom - bh / 2);
+  ctx.restore();
+}
+
+function render(canvas, pxPerMm, s) {
+  const lay = s.mode === 'random'
+    ? randomPack(s)
+    : s.mode === 'flush'
+      ? flushLayout(s)
+      : layout(s.items, s.W, s.H, s.gap, s.nRows);
+  const pageH = s.mode === 'flush' ? lay.H : s.H;
+  canvas.width = Math.round(s.W * pxPerMm);
+  canvas.height = Math.round(pageH * pxPerMm);
+  const ctx = canvas.getContext('2d');
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = s.quality;
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  for (const c of lay.cells) {
+    ctx.drawImage(c.img, c.sx, c.sy, c.sw, c.sh,
+      c.x * pxPerMm, c.y * pxPerMm, c.w * pxPerMm, c.h * pxPerMm);
+    if (s.captions) drawCaption(ctx, c, pxPerMm);
+  }
+  return lay;
+}
+
+function state() {
+  const [a, b] = SIZES[$('size').value];
+  const landscape = $('orient').value === 'landscape';
+  const W = landscape ? Math.max(a, b) : Math.min(a, b);
+  const H = landscape ? Math.min(a, b) : Math.max(a, b);
+  const n = +$('count').value;
+  return {
+    W, H,
+    mode: $('mode').value,
+    noise: +$('noise').value,
+    overlap: +$('overlap').value,
+    captions: $('captions').checked,
+    seed: +$('seed').value,
+    gap: +$('gap').value,
+    nRows: +$('rows').value,
+    quality: $('quality').value,
+    items: shuffled(photos, +$('seed').value).slice(0, n),
+  };
+}
+
+let timer = null;
+function update() {
+  clearTimeout(timer);
+  timer = setTimeout(() => {
+    if (!photos.length) return;
+    const s = state();
+    $('vN').textContent = s.items.length;
+    $('vR').textContent = $('rows').value;
+    $('vG').textContent = s.gap;
+    $('vX').textContent = s.noise.toFixed(2);
+    const lay = render($('poster'), 1600 / s.W, s);
+    const warn = lay.overflow ? ` · НЕ ВЛЕЗЛО ${lay.dropped} картинок (уменьшите количество)` : '';
+    let head, pageH = s.H;
+    if (s.mode === 'random') {
+      head = `${lay.cells.length} картинок · случайная упаковка · шум ${s.noise.toFixed(2)} · наложение ${s.overlap.toFixed(2)}`;
+    } else if (s.mode === 'flush') {
+      pageH = lay.H;
+      head = `${lay.cells.length} картинок · вплотную · ${lay.rows} рядов · зазор ${s.gap} · наложение ${s.overlap.toFixed(2)} · шум ${s.noise.toFixed(2)} · высота ${lay.H.toFixed(1)} мм`;
+    } else {
+      head = `${lay.cells.length} картинок · ${lay.rows} рядов · вертикальный зазор ${lay.vgap.toFixed(1)} мм`;
+    }
+    $('info').textContent = `${head} · ${s.W}×${pageH.toFixed(1)} мм · seed ${$('seed').value}${warn}`;
+  }, 30);
+}
+
+function exportPng() {
+  const s = state();
+  const dpi = +$('dpi').value;
+  const c = document.createElement('canvas');
+  render(c, dpi / 25.4, s);
+  c.toBlob(blob => {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `poster_${$('size').value}_${$('orient').value}_seed${$('seed').value}_n${s.items.length}_gap${s.gap}.png`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+  }, 'image/png');
+}
+
+async function loadPhotos() {
+  const list = await (await fetch('photos.json')).json();
+  const loaded = await Promise.all(list.map(entry => new Promise(res => {
+    const im = new Image();
+    im.onload = () => { im.author = entry.author; res(im); };
+    im.onerror = () => res(null);
+    im.src = entry.path;
+  })));
+  photos = loaded.filter(Boolean);
+  const count = $('count');
+  count.max = photos.length;
+  count.value = photos.length;
+  update();
+}
+
+for (const id of ['size', 'orient', 'mode', 'noise', 'overlap', 'captions', 'count', 'rows', 'gap', 'seed', 'quality']) {
+  $(id).addEventListener('input', update);
+  $(id).addEventListener('change', update);
+}
+$('reseed').addEventListener('click', () => {
+  $('seed').value = Math.floor(Math.random() * 100000);
+  update();
+});
+$('export').addEventListener('click', exportPng);
+loadPhotos().catch(e => { $('info').textContent = 'Не загрузились фото: ' + e; });
+</script>
+</body>
+</html>
